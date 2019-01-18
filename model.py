@@ -1,5 +1,5 @@
-import nn
-import utils
+import samplernn.nn as nn
+import samplernn.utils as utils
 
 import torch
 from torch.nn import functional as F
@@ -20,16 +20,18 @@ class SampleRNN(torch.nn.Module):
         ns_frame_samples = map(int, np.cumprod(frame_sizes))
         self.frame_level_rnns = torch.nn.ModuleList([
             FrameLevelRNN(
-                frame_size, n_frame_samples, n_rnn, dim, learn_h0, weight_norm
-            )
-            for (frame_size, n_frame_samples) in zip(
-                frame_sizes, ns_frame_samples
+                frame_size, n_frame_samples, n_rnn, dim,
+                False if idx == len(frame_sizes) - 1 else learn_h0,
+                weight_norm
+            ).cuda()
+            for (idx, frame_size, n_frame_samples) in zip(
+                np.arange(len(frame_sizes)), frame_sizes, ns_frame_samples
             )
         ])
 
         self.sample_level_mlp = SampleLevelMLP(
             frame_sizes[0], dim, q_levels, weight_norm
-        )
+        ).cuda()
 
     @property
     def lookback(self):
@@ -105,7 +107,6 @@ class FrameLevelRNN(torch.nn.Module):
             input += upper_tier_conditioning
 
         reset = hidden is None
-
         if hidden is None:
             (n_rnn, _) = self.h0.size()
             hidden = self.h0.unsqueeze(1) \
@@ -176,10 +177,11 @@ class SampleLevelMLP(torch.nn.Module):
 
         x = F.relu(self.input(prev_samples) + upper_tier_conditioning)
         x = F.relu(self.hidden(x))
-        x = self.output(x).permute(0, 2, 1).contiguous()
+        x = self.output(x) # .permute(0, 2, 1).contiguous()
 
-        return F.log_softmax(x.view(-1, self.q_levels)) \
-                .view(batch_size, -1, self.q_levels)
+        return x
+        # return F.log_softmax(x.view(-1, self.q_levels)) \
+        #         .view(batch_size, -1, self.q_levels)
 
 
 class Runner:
@@ -192,6 +194,11 @@ class Runner:
     def reset_hidden_states(self):
         self.hidden_states = {rnn: None for rnn in self.model.frame_level_rnns}
 
+    def assign_hidden_states(self, init_hiddens):
+        self.reset_hidden_states()
+        init_hiddens = init_hiddens.unsqueeze(0)
+        self.hidden_states[self.model.frame_level_rnns[-1]] = init_hiddens
+
     def run_rnn(self, rnn, prev_samples, upper_tier_conditioning):
         (output, new_hidden) = rnn(
             prev_samples, upper_tier_conditioning, self.hidden_states[rnn]
@@ -199,15 +206,14 @@ class Runner:
         self.hidden_states[rnn] = new_hidden.detach()
         return output
 
-
 class Predictor(Runner, torch.nn.Module):
 
     def __init__(self, model):
         super().__init__(model)
 
-    def forward(self, input_sequences, reset):
+    def forward(self, input_sequences, init_hiddens, reset):
         if reset:
-            self.reset_hidden_states()
+            self.assign_hidden_states(init_hiddens)
 
         (batch_size, _) = input_sequences.size()
 
@@ -238,22 +244,32 @@ class Predictor(Runner, torch.nn.Module):
 
 class Generator(Runner):
 
-    def __init__(self, model, cuda=False):
+    def __init__(self, model, cuda=True):
         super().__init__(model)
         self.cuda = cuda
 
-    def __call__(self, n_seqs, seq_len):
+    def __call__(self, init_hiddens, vid_lens, n_display_samples=1600):
         # generation doesn't work with CUDNN for some reason
-        torch.backends.cudnn.enabled = False
+        # torch.backends.cudnn.enabled = False
 
-        self.reset_hidden_states()
+        n_seqs = len(init_hiddens)
+        seq_len = torch.max(vid_lens)[0]
+        self.assign_hidden_states(init_hiddens)
 
         bottom_frame_size = self.model.frame_level_rnns[0].n_frame_samples
-        sequences = torch.LongTensor(n_seqs, self.model.lookback + seq_len) \
+        sequences = torch.cuda.LongTensor(
+                    n_seqs, self.model.lookback + seq_len) \
                          .fill_(utils.q_zero(self.model.q_levels))
-        frame_level_outputs = [None for _ in self.model.frame_level_rnns]
 
+        probs = torch.cuda.FloatTensor(
+                    n_seqs, self.model.lookback + seq_len, self.model.q_levels) \
+                        .fill_(utils.q_zero(self.model.q_levels))
+
+        frame_level_outputs = [None for _ in self.model.frame_level_rnns]
         for i in range(self.model.lookback, self.model.lookback + seq_len):
+            if i % n_display_samples == 0:
+                print("\x1b[2KGenerated %d samples" % i, end="\r")
+
             for (tier_index, rnn) in \
                     reversed(list(enumerate(self.model.frame_level_rnns))):
                 if i % rnn.n_frame_samples != 0:
@@ -288,14 +304,19 @@ class Generator(Runner):
             )
             if self.cuda:
                 prev_samples = prev_samples.cuda()
+
             upper_tier_conditioning = \
                 frame_level_outputs[0][:, i % bottom_frame_size, :] \
                                       .unsqueeze(1)
+
             sample_dist = self.model.sample_level_mlp(
                 prev_samples, upper_tier_conditioning
-            ).squeeze(1).exp_().data
-            sequences[:, i] = sample_dist.multinomial(1).squeeze(1)
+            ).squeeze(1).data.squeeze(2)
+            probs[:, i] = sample_dist
 
-        torch.backends.cudnn.enabled = True
+            _, indices = sample_dist.max(1)
+            sequences[:, i] = indices
 
-        return sequences[:, self.model.lookback :]
+        # torch.backends.cudnn.enabled = True
+        return sequences[:, self.model.lookback :], \
+               probs[:, self.model.lookback :].permute(0, 2, 1)
